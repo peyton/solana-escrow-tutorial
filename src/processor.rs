@@ -3,11 +3,13 @@ use solana_program::{
     entrypoint::ProgramResult,
     program_error::ProgramError,
     msg,
-    program::invoke,
+    program::{invoke, invoke_signed},
     program_pack::{Pack, IsInitialized},
     pubkey::Pubkey,
     sysvar::{rent::Rent, Sysvar},
 };
+
+use spl_token::state::Account as TokenAccount;
 
 use crate::{
     error::EscrowError,
@@ -26,6 +28,11 @@ impl Processor {
             EscrowInstruction::InitEscrow { amount } => {
                 msg!("Instruction: InitEscrow");
                 Self::process_init_escrow(accounts, amount, program_id)
+            },
+
+            EscrowInstruction::Exchange { amount } => {
+                msg!("Instruction: Exchange");
+                Self::process_exchange(accounts, amount, program_id)
             }
         }
     }
@@ -69,7 +76,7 @@ impl Processor {
 
         Escrow::pack(escrow_info, &mut escrow_account.try_borrow_mut_data()?)?;
 
-        let (pda, _bump_seed) = Pubkey::find_program_address(&[b"escrow"], program_id);
+        let (pda, _) = Pubkey::find_program_address(&[b"escrow"], program_id);
 
         let token_program = next_account_info(account_info_iter)?;
         let owner_change_ix = spl_token::instruction::set_authority(
@@ -90,6 +97,131 @@ impl Processor {
                 token_program.clone(),
             ],
         )?;
+
+        Ok(())
+    }
+
+    fn process_exchange(
+        accounts: &[AccountInfo],
+        amount_expected_by_taker: u64,
+        program_id: &Pubkey,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+
+        let taker = next_account_info(account_info_iter)?;
+        if !taker.is_signer {
+            return Err(ProgramError::MissingRequiredSignature);
+        }
+
+        let taker_token_account_send = next_account_info(account_info_iter)?;
+        if *taker_token_account_send.owner != spl_token::id() {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+
+        let taker_token_account_receive = next_account_info(account_info_iter)?;
+        if *taker_token_account_receive.owner != spl_token::id() {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+
+        let pda_temp_token_account = next_account_info(account_info_iter)?;
+        if *pda_temp_token_account.owner != spl_token::id() {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+        let pda_temp_token_account_info = TokenAccount::unpack(&pda_temp_token_account.try_borrow_data()?)?;
+        let (pda, bump_seed) = Pubkey::find_program_address(&[b"escrow"], program_id);
+
+        if amount_expected_by_taker != pda_temp_token_account_info.amount {
+            return Err(EscrowError::ExpectedAmountMismatch.into());
+        }
+
+        let initializer_main_account = next_account_info(account_info_iter)?;
+        let initializer_token_account_receive = next_account_info(account_info_iter)?;
+        if *initializer_token_account_receive.owner != spl_token::id() {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+
+        let escrow_account = next_account_info(account_info_iter)?;
+        let escrow_info = Escrow::unpack(&escrow_account.try_borrow_data()?)?;
+
+        if escrow_info.temp_token_account_pubkey != *pda_temp_token_account.key {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        if escrow_info.initializer_pubkey != *initializer_main_account.key {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        if escrow_info.initializer_token_to_receive_account_pubkey != *initializer_token_account_receive.key {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let token_program = next_account_info(account_info_iter)?;
+        let transfer_to_initializer_ix = spl_token::instruction::transfer(
+            token_program.key,
+            taker_token_account_send.key,
+            initializer_token_account_receive.key,
+            taker.key,
+            &[&taker.key],
+            escrow_info.expected_amount,
+        )?;
+        msg!("Calling the token program to transfer tokens to the escrow's initiator...");
+        invoke(
+            &transfer_to_initializer_ix,
+            &[
+                taker_token_account_send.clone(),
+                initializer_token_account_receive.clone(),
+                taker.clone(),
+                token_program.clone(),
+            ],
+        )?;
+
+        let pda_account = next_account_info(account_info_iter)?;
+
+        let transfer_token_to_taker_ix = spl_token::instruction::transfer(
+            token_program.key,
+            pda_temp_token_account.key,
+            taker_token_account_receive.key,
+            &pda,
+            &[&pda],
+            pda_temp_token_account_info.amount,
+        )?;
+        msg!("Calling the token program to transfer tokens to the taker...");
+        invoke_signed(
+            &transfer_token_to_taker_ix,
+            &[
+                pda_temp_token_account.clone(),
+                taker_token_account_receive.clone(),
+                pda_account.clone(),
+                token_program.clone(),
+            ],
+            &[&[&b"escrow"[..], &[bump_seed]]],
+        )?;
+
+        let close_pdas_temp_acc_ix = spl_token::instruction::close_account(
+            token_program.key,
+            pda_temp_token_account.key,
+            initializer_main_account.key,
+            &pda,
+            &[&pda],
+        )?;
+        msg!("Calling the token program to close PDA's temp account...");
+        invoke_signed(
+            &close_pdas_temp_acc_ix,
+            &[
+                pda_temp_token_account.clone(),
+                initializer_main_account.clone(),
+                pda_account.clone(),
+                token_program.clone(),
+            ],
+            &[&[&b"escrow"[..], &[bump_seed]]],
+        )?;
+
+        msg!("Closing the escrow account...");
+        **initializer_main_account.lamports.borrow_mut() = initializer_main_account.lamports()
+            .checked_add(escrow_account.lamports())
+            .ok_or(EscrowError::AmountOverflow)?;
+        **escrow_account.lamports.borrow_mut() = 0;
+        *escrow_account.try_borrow_mut_data()? = &mut [];
 
         Ok(())
     }
