@@ -5,8 +5,12 @@ use solana_program::program_error::ProgramError;
 #[derive(Error, Debug, Copy, Clone)]
 pub enum EscrowError {
     /// Invalid instruction
-    #[error("Invalid Instruction")]
+    #[error("Invalid instruction")]
     InvalidInstruction,
+
+    /// Escrow account not rent exempt
+    #[error("Escrow account not rent exempt")]
+    NotRentExempt,
 }
 
 impl From<EscrowError> for ProgramError {
