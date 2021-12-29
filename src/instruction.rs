@@ -23,6 +23,7 @@ pub enum EscrowInstruction {
   }
 }
 
+#[allow(dead_code)]
 impl EscrowInstruction {
   /// Unpacks a byte buffer into a [EscrowInstruction](enum.EscrowInstruction.html).
   pub fn unpack(input: &[u8]) -> Result<Self, ProgramError> {
