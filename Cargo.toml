@@ -6,7 +6,8 @@ license = "WTFPL"
 publish = false
 
 [dependencies]
-solana-program = "=1.9.2"
+solana-program = "1.9.1"
+thiserror = "1.0.30"
 
 [lib]
 crate-type = ["cdylib", "lib"]
